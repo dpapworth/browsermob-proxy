@@ -19,6 +19,7 @@ import net.lightbody.bmp.exception.ProxyExistsException;
 import net.lightbody.bmp.exception.ProxyPortsExhaustedException;
 import net.lightbody.bmp.exception.UnsupportedCharsetException;
 import net.lightbody.bmp.filters.JavascriptRequestResponseFilter;
+import net.lightbody.bmp.proxy.CaptureType;
 import net.lightbody.bmp.proxy.LegacyProxyServer;
 import net.lightbody.bmp.proxy.ProxyManager;
 import net.lightbody.bmp.proxy.ProxyServer;
@@ -62,18 +63,21 @@ public class ProxyResource {
 
     @Get
     public Reply<?> getProxies() {
-        Collection<ProxyDescriptor> proxyList = new ArrayList<ProxyDescriptor> ();
+        Collection<ProxyDescriptor> proxyList = new ArrayList<ProxyDescriptor>();
         for (LegacyProxyServer proxy : proxyManager.get()) {
             proxyList.add(new ProxyDescriptor(proxy.getPort()));
         }
         return Reply.with(new ProxyListDescriptor(proxyList)).as(Json.class);
     }
-            
+
     @Post
     public Reply<?> newProxy(Request<String> request) {
         String systemProxyHost = System.getProperty("http.proxyHost");
         String systemProxyPort = System.getProperty("http.proxyPort");
         String httpProxy = request.param("httpProxy");
+        String proxyUsername = request.param("proxyUsername");
+        String proxyPassword = request.param("proxyPassword");
+
         Hashtable<String, String> options = new Hashtable<String, String>();
 
         // If the upstream proxy is specified via query params that should override any default system level proxy.
@@ -83,21 +87,32 @@ public class ProxyResource {
             options.put("httpProxy", String.format("%s:%s", systemProxyHost, systemProxyPort));
         }
 
+        // this is a short-term work-around for Proxy Auth in the REST API until the upcoming REST API refactor
+        if (proxyUsername != null && proxyPassword != null) {
+            options.put("proxyUsername", proxyUsername);
+            options.put("proxyPassword", proxyPassword);
+        }
+
         String paramBindAddr = request.param("bindAddress");
         Integer paramPort = request.param("port") == null ? null : Integer.parseInt(request.param("port"));
+
         String useEccString = request.param("useEcc");
         boolean useEcc = Boolean.parseBoolean(useEccString);
-        LOG.debug("POST proxy instance on bindAddress `{}` & port `{}`", 
+
+        String trustAllServersString = request.param("trustAllServers");
+        boolean trustAllServers = Boolean.parseBoolean(trustAllServersString);
+
+        LOG.debug("POST proxy instance on bindAddress `{}` & port `{}`",
                 paramBindAddr, paramPort);
         LegacyProxyServer proxy;
-        try{
-            proxy = proxyManager.create(options, paramPort, paramBindAddr, useEcc);
-        }catch(ProxyExistsException ex){
+        try {
+            proxy = proxyManager.create(options, paramPort, paramBindAddr, useEcc, trustAllServers);
+        } catch (ProxyExistsException ex) {
             return Reply.with(new ProxyDescriptor(ex.getPort())).status(455).as(Json.class);
-        }catch(ProxyPortsExhaustedException ex){
+        } catch (ProxyPortsExhaustedException ex) {
             return Reply.saying().status(456);
-        }catch(Exception ex){
-            StringWriter s = new StringWriter();            
+        } catch (Exception ex) {
+            StringWriter s = new StringWriter();
             ex.printStackTrace(new PrintWriter(s));
             return Reply.with(s).as(Text.class).status(550);
         }
@@ -131,10 +146,16 @@ public class ProxyResource {
 
         String captureHeaders = request.param("captureHeaders");
         String captureContent = request.param("captureContent");
-        String captureBinaryContent = request.param("captureBinaryContent"); 
+        String captureBinaryContent = request.param("captureBinaryContent");
         proxy.setCaptureHeaders(Boolean.parseBoolean(captureHeaders));
         proxy.setCaptureContent(Boolean.parseBoolean(captureContent));
-        proxy.setCaptureBinaryContent(Boolean.parseBoolean(captureBinaryContent)); 
+        proxy.setCaptureBinaryContent(Boolean.parseBoolean(captureBinaryContent));
+
+        String captureCookies = request.param("captureCookies");
+        if (proxy instanceof BrowserMobProxyServer && Boolean.parseBoolean(captureCookies)) {
+            BrowserMobProxyServer browserMobProxyServer = (BrowserMobProxyServer) proxy;
+            browserMobProxyServer.enableHarCaptureTypes(CaptureType.getCookieCaptureTypes());
+        }
 
         if (oldHar != null) {
             return Reply.with(oldHar).as(Json.class);
@@ -179,12 +200,12 @@ public class ProxyResource {
 
         String blacklist = request.param("regex");
         int responseCode = parseResponseCode(request.param("status"));
-		String method = request.param("method");
+        String method = request.param("method");
         proxy.blacklistRequests(blacklist, responseCode, method);
 
         return Reply.saying().ok();
     }
-    
+
     @Delete
     @At("/:port/blacklist")
     public Reply<?> clearBlacklist(@Named("port") int port, Request<String> request) {
@@ -222,7 +243,7 @@ public class ProxyResource {
 
         return Reply.saying().ok();
     }
-    
+
     @Delete
     @At("/:port/whitelist")
     public Reply<?> clearWhitelist(@Named("port") int port, Request<String> request) {
@@ -283,7 +304,7 @@ public class ProxyResource {
 
         ScriptEngineManager mgr = new ScriptEngineManager();
         final ScriptEngine engine = mgr.getEngineByName("JavaScript");
-        Compilable compilable = (Compilable)  engine;
+        Compilable compilable = (Compilable) engine;
         final CompiledScript script = compilable.compile(baos.toString());
 
         proxy.addResponseInterceptor(new ResponseInterceptor() {
@@ -321,7 +342,7 @@ public class ProxyResource {
 
         ScriptEngineManager mgr = new ScriptEngineManager();
         final ScriptEngine engine = mgr.getEngineByName("JavaScript");
-        Compilable compilable = (Compilable)  engine;
+        Compilable compilable = (Compilable) engine;
         final CompiledScript script = compilable.compile(baos.toString());
 
         proxy.addRequestInterceptor(new RequestInterceptor() {
@@ -404,14 +425,16 @@ public class ProxyResource {
             try {
                 streamManager.setUpstreamKbps(Integer.parseInt(upstreamKbps));
                 streamManager.enable();
-            } catch (NumberFormatException e) { }
+            } catch (NumberFormatException e) {
+            }
         }
 
         String upstreamBps = request.param("upstreamBps");
         if (upstreamBps != null) {
             try {
                 ((BrowserMobProxy) proxy).setWriteBandwidthLimit(Integer.parseInt(upstreamBps));
-            } catch (NumberFormatException e) {}
+            } catch (NumberFormatException e) {
+            }
         }
 
         String downstreamKbps = request.param("downstreamKbps");
@@ -419,14 +442,16 @@ public class ProxyResource {
             try {
                 streamManager.setDownstreamKbps(Integer.parseInt(downstreamKbps));
                 streamManager.enable();
-            } catch (NumberFormatException e) { }
+            } catch (NumberFormatException e) {
+            }
         }
 
         String downstreamBps = request.param("downstreamBps");
         if (downstreamBps != null) {
             try {
                 ((BrowserMobProxy) proxy).setReadBandwidthLimit(Integer.parseInt(downstreamBps));
-            } catch (NumberFormatException e) {}
+            } catch (NumberFormatException e) {
+            }
         }
 
         String upstreamMaxKB = request.param("upstreamMaxKB");
@@ -434,37 +459,42 @@ public class ProxyResource {
             try {
                 streamManager.setUpstreamMaxKB(Integer.parseInt(upstreamMaxKB));
                 streamManager.enable();
-            } catch (NumberFormatException e) { }
+            } catch (NumberFormatException e) {
+            }
         }
         String downstreamMaxKB = request.param("downstreamMaxKB");
         if (downstreamMaxKB != null) {
             try {
                 streamManager.setDownstreamMaxKB(Integer.parseInt(downstreamMaxKB));
                 streamManager.enable();
-            } catch (NumberFormatException e) { }
-        }        
+            } catch (NumberFormatException e) {
+            }
+        }
         String latency = request.param("latency");
         if (latency != null) {
             try {
                 streamManager.setLatency(Integer.parseInt(latency));
                 streamManager.enable();
-            } catch (NumberFormatException e) { }
+            } catch (NumberFormatException e) {
+            }
         }
         String payloadPercentage = request.param("payloadPercentage");
         if (payloadPercentage != null) {
             try {
                 streamManager.setPayloadPercentage(Integer.parseInt(payloadPercentage));
-            } catch (NumberFormatException e) { }
+            } catch (NumberFormatException e) {
+            }
         }
         String maxBitsPerSecond = request.param("maxBitsPerSecond");
         if (maxBitsPerSecond != null) {
             try {
                 streamManager.setMaxBitsPerSecondThreshold(Integer.parseInt(maxBitsPerSecond));
-            } catch (NumberFormatException e) { }
+            } catch (NumberFormatException e) {
+            }
         }
         String enable = request.param("enable");
         if (enable != null) {
-            if( Boolean.parseBoolean(enable) ) {
+            if (Boolean.parseBoolean(enable)) {
                 streamManager.enable();
             } else {
                 streamManager.disable();
@@ -472,17 +502,17 @@ public class ProxyResource {
         }
         return Reply.saying().ok();
     }
-    
+
     @Get
     @At("/:port/limit")
     public Reply<?> getLimits(@Named("port") int port, Request<String> request) {
         LegacyProxyServer proxy = proxyManager.get(port);
         if (proxy == null) {
             return Reply.saying().notFound();
-        }                
+        }
         return Reply.with(new BandwidthLimitDescriptor(proxy.getStreamManager())).as(Json.class);
     }
-    
+
     @Put
     @At("/:port/timeout")
     public Reply<?> timeout(@Named("port") int port, Request<String> request) {
@@ -495,25 +525,29 @@ public class ProxyResource {
         if (requestTimeout != null) {
             try {
                 proxy.setRequestTimeout(Integer.parseInt(requestTimeout));
-            } catch (NumberFormatException e) { }
+            } catch (NumberFormatException e) {
+            }
         }
         String readTimeout = request.param("readTimeout");
         if (readTimeout != null) {
             try {
                 proxy.setSocketOperationTimeout(Integer.parseInt(readTimeout));
-            } catch (NumberFormatException e) { }
+            } catch (NumberFormatException e) {
+            }
         }
         String connectionTimeout = request.param("connectionTimeout");
         if (connectionTimeout != null) {
             try {
                 proxy.setConnectionTimeout(Integer.parseInt(connectionTimeout));
-            } catch (NumberFormatException e) { }
+            } catch (NumberFormatException e) {
+            }
         }
         String dnsCacheTimeout = request.param("dnsCacheTimeout");
         if (dnsCacheTimeout != null) {
             try {
                 proxy.setDNSCacheTimeout(Integer.parseInt(dnsCacheTimeout));
-            } catch (NumberFormatException e) { }
+            } catch (NumberFormatException e) {
+            }
         }
         return Reply.saying().ok();
     }
@@ -565,7 +599,7 @@ public class ProxyResource {
         proxy.waitForNetworkTrafficToStop(Integer.parseInt(quietPeriodInMs), Integer.parseInt(timeoutInMs));
         return Reply.saying().ok();
     }
-    
+
     @Delete
     @At("/:port/dns/cache")
     public Reply<?> clearDnsCache(@Named("port") int port) {
@@ -574,7 +608,7 @@ public class ProxyResource {
             return Reply.saying().notFound();
         }
 
-    	proxy.clearDNSCache();
+        proxy.clearDNSCache();
         return Reply.saying().ok();
     }
 
@@ -590,8 +624,8 @@ public class ProxyResource {
         String replace = request.param("replace");
         proxy.rewriteUrl(match, replace);
         return Reply.saying().ok();
-    } 
-    
+    }
+
     @Delete
     @At("/:port/rewrite")
     public Reply<?> clearRewriteRules(@Named("port") int port, Request<String> request) {
@@ -600,10 +634,10 @@ public class ProxyResource {
             return Reply.saying().notFound();
         }
 
-    	proxy.clearRewriteRules();
-    	return Reply.saying().ok();
+        proxy.clearRewriteRules();
+        return Reply.saying().ok();
     }
-    
+
     @Put
     @At("/:port/retry")
     public Reply<?> retryCount(@Named("port") int port, Request<String> request) {
@@ -615,14 +649,15 @@ public class ProxyResource {
         String count = request.param("retrycount");
         proxy.setRetryCount(Integer.parseInt(count));
         return Reply.saying().ok();
-    } 
-    
+    }
+
     private int parseResponseCode(String response) {
         int responseCode = 200;
         if (response != null) {
             try {
                 responseCode = Integer.parseInt(response);
-            } catch (NumberFormatException e) { }
+            } catch (NumberFormatException e) {
+            }
         }
         return responseCode;
     }
@@ -664,17 +699,17 @@ public class ProxyResource {
             this.proxyList = proxyList;
         }
     }
-           
+
     public static class BandwidthLimitDescriptor {
         private long maxUpstreamKB;
         private long remainingUpstreamKB;
         private long maxDownstreamKB;
         private long remainingDownstreamKB;
-        
-        public BandwidthLimitDescriptor(){
+
+        public BandwidthLimitDescriptor() {
         }
-        
-        public BandwidthLimitDescriptor(StreamManager manager){
+
+        public BandwidthLimitDescriptor(StreamManager manager) {
             this.maxDownstreamKB = manager.getMaxDownstreamKB();
             this.remainingDownstreamKB = manager.getRemainingDownstreamKB();
             this.maxUpstreamKB = manager.getMaxUpstreamKB();
@@ -711,7 +746,7 @@ public class ProxyResource {
 
         public void setRemainingDownstreamKB(long remainingDownstreamKB) {
             this.remainingDownstreamKB = remainingDownstreamKB;
-        }        
+        }
     }
 
     private String getEntityBodyFromRequest(Request<String> request) throws IOException {

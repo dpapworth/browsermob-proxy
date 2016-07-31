@@ -6,6 +6,7 @@ import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.ImmutableList;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SupportedCipherSuiteFilter;
@@ -15,6 +16,7 @@ import net.lightbody.bmp.mitm.CertificateInfo;
 import net.lightbody.bmp.mitm.CertificateInfoGenerator;
 import net.lightbody.bmp.mitm.HostnameCertificateInfoGenerator;
 import net.lightbody.bmp.mitm.RootCertificateGenerator;
+import net.lightbody.bmp.mitm.TrustSource;
 import net.lightbody.bmp.mitm.exception.MitmException;
 import net.lightbody.bmp.mitm.exception.SslContextInitializationException;
 import net.lightbody.bmp.mitm.keys.ECKeyGenerator;
@@ -26,6 +28,7 @@ import net.lightbody.bmp.mitm.tools.SecurityProviderTool;
 import net.lightbody.bmp.mitm.util.EncryptionUtil;
 import net.lightbody.bmp.mitm.util.MitmConstants;
 import net.lightbody.bmp.mitm.util.SslUtil;
+import net.lightbody.bmp.util.HttpUtil;
 import org.littleshoot.proxy.MitmManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -68,7 +71,7 @@ public class ImpersonatingMitmManager implements MitmManager {
     private final Supplier<SslContext> upstreamServerSslContext = Suppliers.memoize(new Supplier<SslContext>() {
         @Override
         public SslContext get() {
-            return SslUtil.getUpstreamServerSslContext(trustAllUpstreamServers, serverCipherSuites);
+            return SslUtil.getUpstreamServerSslContext(serverCipherSuites, trustSource);
         }
     });
 
@@ -96,9 +99,10 @@ public class ImpersonatingMitmManager implements MitmManager {
     private final String serverCertificateMessageDigest;
 
     /**
-     * Disables all upstream certificate validation. Should only be used during testing.
+     * The source of trusted root CAs. May be null, which disables all upstream certificate validation. Disabling upstream
+     * certificate validation allows attackers to intercept communciations and should only be used during testing.
      */
-    private final boolean trustAllUpstreamServers;
+    private final TrustSource trustSource;
 
     /**
      * Utility used to generate {@link CertificateInfo} objects when impersonating an upstream server.
@@ -133,7 +137,7 @@ public class ImpersonatingMitmManager implements MitmManager {
     public ImpersonatingMitmManager(CertificateAndKeySource rootCertificateSource,
                                     KeyGenerator serverKeyGenerator,
                                     String serverMessageDigest,
-                                    boolean trustAllUpstreamServers,
+                                    TrustSource trustSource,
                                     int sslContextCacheConcurrencyLevel,
                                     long cacheExpirationIntervalMs,
                                     SecurityProviderTool securityProviderTool,
@@ -162,7 +166,7 @@ public class ImpersonatingMitmManager implements MitmManager {
 
         this.rootCertificateSource = rootCertificateSource;
 
-        this.trustAllUpstreamServers = trustAllUpstreamServers;
+        this.trustSource = trustSource;
 
         this.serverCertificateMessageDigest = serverMessageDigest;
 
@@ -185,6 +189,17 @@ public class ImpersonatingMitmManager implements MitmManager {
     }
 
     @Override
+    public SSLEngine serverSslEngine() {
+        try {
+            SSLEngine sslEngine = upstreamServerSslContext.get().newEngine(ByteBufAllocator.DEFAULT);
+
+            return sslEngine;
+        } catch (RuntimeException e) {
+            throw new MitmException("Error creating SSLEngine for connection to upstream server", e);
+        }
+    }
+
+    @Override
     public SSLEngine serverSslEngine(String peerHost, int peerPort) {
         try {
             SSLEngine sslEngine = upstreamServerSslContext.get().newEngine(ByteBufAllocator.DEFAULT, peerHost, peerPort);
@@ -201,13 +216,15 @@ public class ImpersonatingMitmManager implements MitmManager {
     }
 
     @Override
-    public SSLEngine clientSslEngineFor(SSLSession sslSession) {
+    public SSLEngine clientSslEngineFor(HttpRequest httpRequest, SSLSession sslSession) {
+        String requestedHostname = HttpUtil.getHostFromRequest(httpRequest);
+
         try {
-            SslContext ctx = getHostnameImpersonatingSslContext(sslSession);
+            SslContext ctx = getHostnameImpersonatingSslContext(requestedHostname, sslSession);
 
             return ctx.newEngine(ByteBufAllocator.DEFAULT);
         } catch (RuntimeException e) {
-            throw new MitmException("Error creating SSLEngine for connection to client to impersonate upstream host: " + sslSession.getPeerHost(), e);
+            throw new MitmException("Error creating SSLEngine for connection to client to impersonate upstream host: " + requestedHostname, e);
         }
     }
 
@@ -216,14 +233,11 @@ public class ImpersonatingMitmManager implements MitmManager {
      * created for this hostname and is stored in the cache, it will be reused. Otherwise, a certificate will be created
      * which impersonates the specified hostname.
      *
+     * @param hostnameToImpersonate the hostname for which the impersonated SSLContext is being requested
      * @param sslSession the upstream server SSLSession
      * @return SSLContext which will present an impersonated certificate
      */
-    private SslContext getHostnameImpersonatingSslContext(final SSLSession sslSession) {
-        final String hostnameToImpersonate = sslSession.getPeerHost();
-
-        //TODO: generate wildcard certificates, rather than one certificate per host, to reduce the number of certs generated
-
+    private SslContext getHostnameImpersonatingSslContext(final String hostnameToImpersonate, final SSLSession sslSession) {
         try {
             return sslContextCache.get(hostnameToImpersonate, new Callable<SslContext>() {
                 @Override
@@ -234,29 +248,43 @@ public class ImpersonatingMitmManager implements MitmManager {
         } catch (ExecutionException e) {
             throw new SslContextInitializationException("An error occurred while impersonating the remote host: " + hostnameToImpersonate, e);
         }
+
+        //TODO: generate wildcard certificates, rather than one certificate per host, to reduce the number of certs generated
     }
 
     /**
      * Creates an SSLContext that will present an impersonated certificate for the specified hostname to the client.
+     * This is a convenience method for {@link #createImpersonatingSslContext(CertificateInfo)} that generates the
+     * {@link CertificateInfo} from the specified hostname using the {@link #certificateInfoGenerator}.
      *
-     * @param sslSession            sslSession between the proxy and the upstream server
+     * @param sslSession sslSession between the proxy and the upstream server
      * @param hostnameToImpersonate hostname (supplied by the client's HTTP CONNECT) that will be impersonated
      * @return an SSLContext presenting a certificate matching the hostnameToImpersonate
      */
     private SslContext createImpersonatingSslContext(SSLSession sslSession, String hostnameToImpersonate) {
-        long impersonationStart = System.currentTimeMillis();
-
-        // generate a Java KeyStore which contains the impersonated server certificate and the certificate's private key.
-        // the SSLContext will send the impersonated certificate to clients to impersonate the real upstream server, and
-        // will use the private key to encrypt the channel.
-
         // get the upstream server's certificate so the certificateInfoGenerator can (optionally) use it to construct a forged certificate
         X509Certificate originalCertificate = SslUtil.getServerCertificate(sslSession);
 
         // get the CertificateInfo that will be used to populate the impersonated X509Certificate
         CertificateInfo certificateInfo = certificateInfoGenerator.generate(Collections.singletonList(hostnameToImpersonate), originalCertificate);
 
-        // generate a public and private key pair for the forged certificate
+        SslContext sslContext = createImpersonatingSslContext(certificateInfo);
+
+        return sslContext;
+    }
+
+    /**
+     * Generates an {@link SslContext} using an impersonated certificate containing the information in the specified
+     * certificateInfo.
+     *
+     * @param certificateInfo certificate information to impersonate
+     * @return an SslContext that will present the impersonated certificate to the client
+     */
+    private SslContext createImpersonatingSslContext(CertificateInfo certificateInfo) {
+        long impersonationStart = System.currentTimeMillis();
+
+        // generate a public and private key pair for the forged certificate. the SslContext will send the impersonated certificate to clients
+        // to impersonate the real upstream server, and will use the private key to encrypt the channel.
         KeyPair serverKeyPair = serverKeyGenerator.generate();
 
         // get the CA root certificate and private key that will be used to sign the forced certificate
@@ -299,7 +327,7 @@ public class ImpersonatingMitmManager implements MitmManager {
 
         statistics.certificateCreated(impersonationStart, impersonationFinish);
 
-        log.debug("Impersonated certificate for {} in {}ms", hostnameToImpersonate, impersonationFinish - impersonationStart);
+        log.debug("Impersonated certificate for {} in {}ms", certificateInfo.getCommonName(), impersonationFinish - impersonationStart);
 
         return sslContext;
     }
@@ -339,7 +367,7 @@ public class ImpersonatingMitmManager implements MitmManager {
 
         private KeyGenerator serverKeyGenerator = new RSAKeyGenerator();
 
-        private boolean trustAllServers = false;
+        private TrustSource trustSource = TrustSource.defaultTrustSource();
 
         private int cacheConcurrencyLevel = 8;
         private long cacheExpirationIntervalMs = TimeUnit.MILLISECONDS.convert(5, TimeUnit.MINUTES);
@@ -378,9 +406,28 @@ public class ImpersonatingMitmManager implements MitmManager {
         /**
          * When true, no upstream certificate verification will be performed. <b>This will make it possible for
          * attackers to MITM communications with the upstream server</b>, so use trustAllServers only when testing.
+         * Calling this method with 'true' will remove any trustSource set with {@link #trustSource(TrustSource)}.
+         * Calling this method with 'false' has no effect unless trustAllServers was previously called with 'true'.
+         * To set a specific TrustSource, use {@link #trustSource(TrustSource)}.
          */
         public Builder trustAllServers(boolean trustAllServers) {
-            this.trustAllServers = trustAllServers;
+            if (trustAllServers) {
+                this.trustSource = null;
+            } else {
+                // if the TrustSource was previously removed, restore it to the default. otherwise keep the existing TrustSource.
+                if (this.trustSource == null) {
+                    this.trustSource = TrustSource.defaultTrustSource();
+                }
+            }
+
+            return this;
+        }
+
+        /**
+         * The TrustSource that supplies the trusted root CAs used to validate upstream servers' certificates.
+         */
+        public Builder trustSource(TrustSource trustSource) {
+            this.trustSource = trustSource;
             return this;
         }
 
@@ -458,7 +505,7 @@ public class ImpersonatingMitmManager implements MitmManager {
                     rootCertificateSource,
                     serverKeyGenerator,
                     serverMessageDigest,
-                    trustAllServers,
+                    trustSource,
                     cacheConcurrencyLevel,
                     cacheExpirationIntervalMs,
                     securityProviderTool,

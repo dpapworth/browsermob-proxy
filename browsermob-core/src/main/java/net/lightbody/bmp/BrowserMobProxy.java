@@ -3,7 +3,7 @@ package net.lightbody.bmp;
 import net.lightbody.bmp.core.har.Har;
 import net.lightbody.bmp.filters.RequestFilter;
 import net.lightbody.bmp.filters.ResponseFilter;
-import net.lightbody.bmp.mitm.manager.ImpersonatingMitmManager;
+import net.lightbody.bmp.mitm.TrustSource;
 import net.lightbody.bmp.proxy.BlacklistEntry;
 import net.lightbody.bmp.proxy.CaptureType;
 import net.lightbody.bmp.proxy.auth.AuthType;
@@ -238,11 +238,21 @@ public interface BrowserMobProxy {
     void setReadBandwidthLimit(long bytesPerSecond);
 
     /**
+     * Returns the current bandwidth limit for reading, in bytes per second.
+     */
+    long getReadBandwidthLimit();
+
+    /**
      * Sets the maximum bandwidth to consume when sending requests to servers.
      *
      * @param bytesPerSecond maximum bandwidth, in bytes per second
      */
     void setWriteBandwidthLimit(long bytesPerSecond);
+
+    /**
+     * Returns the current bandwidth limit for writing, in bytes per second.
+     */
+    long getWriteBandwidthLimit();
 
     /**
      * The minimum amount of time that will elapse between the time the proxy begins receiving a response from the server and the time the
@@ -303,6 +313,16 @@ public interface BrowserMobProxy {
     void stopAutoAuthorization(String domain);
 
     /**
+     * Enables chained proxy authorization using the Proxy-Authorization header described in RFC 7235, section 4.4 (https://tools.ietf.org/html/rfc7235#section-4.4).
+     * Currently, only {@link AuthType#BASIC} authentication is supported.
+     *
+     * @param username the username to use to authenticate with the chained proxy
+     * @param password the password to use to authenticate with the chained proxy
+     * @param authType the auth type to use (currently, must be BASIC)
+     */
+    void chainedProxyAuthorization(String username, String password, AuthType authType);
+
+    /**
      * Adds a rewrite rule for the specified URL-matching regular expression. If there are any existing rewrite rules, the new rewrite
      * rule will be applied last, after all other rewrite rules are applied. The specified urlPattern will be replaced with the specified
      * replacement expression. The urlPattern is treated as a Java regular expression and must be properly escaped (see {@link java.util.regex.Pattern}).
@@ -319,7 +339,7 @@ public interface BrowserMobProxy {
      * <p/>
      * For example, the following rewrite rule:
      *
-     * <pre>   {@code proxy.rewriteUrl("http://www\.(yahoo|bing)\.com\?(\w+)=(\w+)", "http://www.google.com?originalDomain=$1&$2=$3");}</pre>
+     * <pre>   {@code proxy.rewriteUrl("http://www\\.(yahoo|bing)\\.com/\\?(\\w+)=(\\w+)", "http://www.google.com/?originalDomain=$1&$2=$3");}</pre>
      *
      * will match an HTTP request (but <i>not</i> HTTPS!) to www.yahoo.com or www.bing.com with exactly 1 query parameter,
      * and replace it with a call to www.google.com with an 'originalDomain' query parameter, as well as the original query parameter.
@@ -552,10 +572,6 @@ public interface BrowserMobProxy {
      * {@link HttpFiltersSource#filterRequest(io.netty.handler.codec.http.HttpRequest, io.netty.channel.ChannelHandlerContext)} method and returning an
      * {@link org.littleshoot.proxy.HttpFilters} instance (typically, a subclass of {@link org.littleshoot.proxy.HttpFiltersAdapter}).
      * To disable or bypass a filter on a per-request basis, the filterRequest() method may return null.
-     * <p/>
-     * <b>Note:</b> This method is only available in the LittleProxy-based implementation of BrowserMob Proxy. The legacy {@link net.lightbody.bmp.proxy.ProxyServer}
-     * implementation will not use the HTTP filters. You <b>must</b> use the addRequestInterceptor() and addResponseInterceptor() methods in
-     * {@link net.lightbody.bmp.proxy.LegacyProxyServer} when using the legacy ProxyServer implementation.
      *
      * @param filterFactory factory to generate HttpFilters
      */
@@ -568,12 +584,8 @@ public interface BrowserMobProxy {
      * {@link HttpFiltersSource#filterRequest(io.netty.handler.codec.http.HttpRequest, io.netty.channel.ChannelHandlerContext)} method and returning an
      * {@link org.littleshoot.proxy.HttpFilters} instance (typically, a subclass of {@link org.littleshoot.proxy.HttpFiltersAdapter}).
      * To disable or bypass a filter on a per-request basis, the filterRequest() method may return null.
-     * <p/>
-     * <b>Note:</b> This method is only available in the LittleProxy-based implementation of BrowserMob Proxy. The legacy {@link net.lightbody.bmp.proxy.ProxyServer}
-     * implementation will not use the HTTP filters. You <b>must</b> use the addRequestInterceptor() and addResponseInterceptor() methods in
-     * {@link net.lightbody.bmp.proxy.LegacyProxyServer} when using the legacy ProxyServer implementation.
      *
-     * @param filterFactory factory to generate HttpFilters
+     *  @param filterFactory factory to generate HttpFilters
      */
     void addLastHttpFilterFactory(HttpFiltersSource filterFactory);
 
@@ -603,7 +615,7 @@ public interface BrowserMobProxy {
     /**
      * Sets the MITM manager, which is responsible for generating forged SSL certificates to present to clients. By default,
      * BrowserMob Proxy uses the ca-certificate-rsa.cer root certificate for impersonation. See the documentation at
-     * {@link ImpersonatingMitmManager} and {@link ImpersonatingMitmManager.Builder}
+     * {@link net.lightbody.bmp.mitm.manager.ImpersonatingMitmManager} and {@link net.lightbody.bmp.mitm.manager.ImpersonatingMitmManager.Builder}
      * for details on customizing the root and server certificate generation.
      *
      * @param mitmManager MITM manager to use
@@ -618,4 +630,12 @@ public interface BrowserMobProxy {
      * @param trustAllServers when true, disables upstream server certificate verification
      */
     void setTrustAllServers(boolean trustAllServers);
+
+    /**
+     * Sets the {@link TrustSource} that contains trusted root certificate authorities that will be used to validate
+     * upstream servers' certificates. When null, disables certificate validation (see warning at {@link #setTrustAllServers(boolean)}).
+     *
+     * @param trustSource TrustSource containing root CAs, or null to disable upstream server validation
+     */
+    void setTrustSource(TrustSource trustSource);
 }
